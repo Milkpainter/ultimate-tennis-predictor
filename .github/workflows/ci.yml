@@ -1,0 +1,256 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Retrain models weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+
+env:
+  PYTHON_VERSION: '3.11'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov black flake8 isort mypy
+    
+    - name: Code formatting check
+      run: |
+        black --check tennis_predictor/ app/ scripts/
+        isort --check-only tennis_predictor/ app/ scripts/
+    
+    - name: Lint code
+      run: |
+        flake8 tennis_predictor/ app/ scripts/ --max-line-length=120 --ignore=E203,W503
+    
+    - name: Type checking
+      run: |
+        mypy tennis_predictor/ --ignore-missing-imports
+    
+    - name: Run tests
+      run: |
+        pytest tests/ -v --cov=tennis_predictor --cov-report=xml --cov-report=html
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        target: production
+
+  train-models:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Create directories
+      run: |
+        mkdir -p data models/trained logs reports config
+    
+    - name: Download tennis data
+      run: |
+        python scripts/train_models.py --load-atp --data-years 2020 2021 2022 2023 2024
+    
+    - name: Train models with validation
+      run: |
+        python scripts/train_models.py --validation --min-matches 500
+    
+    - name: Upload trained models
+      uses: actions/upload-artifact@v4
+      with:
+        name: trained-models-${{ github.sha }}
+        path: models/trained/
+        retention-days: 30
+    
+    - name: Upload validation report
+      uses: actions/upload-artifact@v4
+      with:
+        name: validation-report-${{ github.sha }}
+        path: reports/
+        retention-days: 90
+    
+    - name: Notify on training completion
+      if: always()
+      run: |
+        echo "Model training completed. Status: ${{ job.status }}"
+        # In production, send notification to Slack/Discord
+
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run security scan
+      uses: pypa/gh-action-pip-audit@v1.0.8
+      with:
+        inputs: requirements.txt
+    
+    - name: Run Bandit security linter
+      run: |
+        pip install bandit[toml]
+        bandit -r tennis_predictor/ app/ -f json -o security-report.json
+    
+    - name: Upload security report
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-report
+        path: security-report.json
+
+  deploy-staging:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging environment"
+        # In production, deploy to staging Kubernetes cluster
+        # kubectl apply -f k8s/staging/
+    
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests on staging deployment"
+        # curl -f http://staging.tennis-predictor.com/health
+
+  deploy-production:
+    needs: [test, build, train-models]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name != 'schedule'
+    environment: production
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production environment"
+        # In production:
+        # 1. Download trained models from artifacts
+        # 2. Deploy to production Kubernetes cluster
+        # 3. Run health checks
+        # 4. Update load balancer routing
+    
+    - name: Run production smoke tests
+      run: |
+        echo "Running production smoke tests"
+        # curl -f http://api.tennis-predictor.com/health
+        # python tests/integration/test_production_api.py
+    
+    - name: Notify deployment success
+      if: success()
+      run: |
+        echo "Production deployment successful!"
+        # Send success notification
+    
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Deployment failed, initiating rollback"
+        # Rollback to previous version
+        # kubectl rollout undo deployment/tennis-predictor
+
+  performance-monitoring:
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Monitor model performance
+      run: |
+        echo "Setting up performance monitoring"
+        # In production:
+        # 1. Configure Grafana dashboards
+        # 2. Set up alerting rules
+        # 3. Monitor prediction accuracy
+        # 4. Track API performance metrics
+    
+    - name: Run model validation
+      run: |
+        echo "Running post-deployment model validation"
+        # Validate model performance on recent data
+        # python scripts/validate_production_models.py
